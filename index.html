@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Simulação: Detecção e Perseguição 2D</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:12px;background:#121212;color:#eaeaea}
+    h1{font-size:18px;margin:0 0 8px}
+    #ui{display:grid;grid-template-columns:360px 1fr;gap:12px}
+    .panel{background:#1c1c1c;padding:12px;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,0.6)}
+    canvas{background:#0b1020;border-radius:6px;display:block}
+    label{display:block;font-size:12px;margin-top:8px}
+    input[type=range]{width:100%}
+    .row{display:flex;gap:8px;align-items:center;margin-top:8px}
+    button{padding:8px 10px;border-radius:6px;border:0;background:#2979ff;color:white;cursor:pointer}
+    button.secondary{background:#444}
+    .stat{font-size:13px;margin-top:8px}
+    select{padding:6px;border-radius:6px;background:#111;color:#eee;border:1px solid #222}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th,td{padding:6px;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px}
+    .legend{display:flex;gap:8px;align-items:center;margin-top:8px}
+    .swatch{width:14px;height:14px;border-radius:3px}
+  </style>
+</head>
+<body>
+  <h1>Simulação: Detecção & Perseguição 2D — "Ligeirinho" vs "Frajola"</h1>
+  <div id="ui">
+    <div class="panel" style="max-height:86vh;overflow:auto">
+      <strong>Controles</strong>
+      <div class="row" style="margin-top:10px">
+        <button id="play">Iniciar</button>
+        <button id="step" class="secondary">Passo</button>
+        <button id="reset" class="secondary">Reset</button>
+        <button id="runBatch" class="secondary">Rodar 50 cenários</button>
+      </div>
+
+      <label>Velocidade Ligeirinho (px/frame): <span id="vTargetLbl">10</span></label>
+      <input id="vTarget" type="range" min="5" max="20" value="10" />
+
+      <label>Velocidade Frajola (px/frame): <span id="vChaserLbl">8</span></label>
+      <input id="vChaser" type="range" min="3" max="16" value="8" />
+
+      <label>Taxa de atualização (FPS): <span id="fpsLbl">60</span></label>
+      <input id="fps" type="range" min="10" max="144" value="60" />
+
+      <label>Sensibilidade de detecção (threshold 0-255): <span id="thLbl">40</span></label>
+      <input id="thresh" type="range" min="10" max="120" value="40" />
+
+      <label>Atraso de reação (frames): <span id="delayLbl">0</span></label>
+      <input id="delay" type="range" min="0" max="20" value="0" />
+
+      <label>Estratégia de perseguição</label>
+      <select id="strategy">
+        <option value="pure">Pursuit Direto (seguir centro detectado)</option>
+        <option value="lead">Previsão Linear (lead)</option>
+        <option value="intercept">Intercepto (fechar ângulo)</option>
+      </select>
+
+      <label>Captura quando distância &lt; <span id="capLbl">20</span> px</label>
+      <input id="captureDist" type="range" min="6" max="60" value="20" />
+
+      <div class="stat">
+        <div>Frame: <span id="frameCount">0</span></div>
+        <div>Detectado: <span id="detected">Não</span></div>
+        <div>Última captura: <span id="lastCapture">--</span></div>
+      </div>
+
+      <strong style="display:block;margin-top:12px">Métricas (execução atual)</strong>
+      <div class="stat">Tempo até captura (frames): <span id="timeToCapture">--</span></div>
+      <div class="stat">Tentativas bem-sucedidas: <span id="successRate">0 / 0</span></div>
+
+      <strong style="display:block;margin-top:12px">Legenda</strong>
+      <div class="legend">
+        <div class="swatch" style="background:#ffcc00"></div> Ligeirinho (alvo)
+      </div>
+      <div class="legend">
+        <div class="swatch" style="background:#42a5f5"></div> Frajola (perseguidor)
+      </div>
+      <div class="legend">
+        <div class="swatch" style="background:#ffffff;opacity:0.2"></div> Máscara de detecção
+      </div>
+
+    </div>
+
+    <div class="panel">
+      <canvas id="scene" width="800" height="600"></canvas>
+      <canvas id="offscreen" width="800" height="600" style="display:none"></canvas>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button id="downloadLog">Exportar CSV de resultados</button>
+        <button id="resetStats" class="secondary">Limpar métricas</button>
+      </div>
+
+      <table id="resultsTable">
+        <thead><tr><th>#</th><th>Estratégia</th><th>Vel T</th><th>Vel F</th><th>Captura? </th><th>Frames</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+// ===================== Config e estado =====================
+const canvas = document.getElementById('scene');
+const ctx = canvas.getContext('2d');
+const off = document.getElementById('offscreen');
+const offCtx = off.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+let cfg = {
+  vTarget: +document.getElementById('vTarget').value,
+  vChaser: +document.getElementById('vChaser').value,
+  fps: +document.getElementById('fps').value,
+  thresh: +document.getElementById('thresh').value,
+  delay: +document.getElementById('delay').value,
+  captureDist: +document.getElementById('captureDist').value,
+  strategy: document.getElementById('strategy').value
+};
+
+let running=false, stepOnce=false;
+let frameCount=0;
+let previousFrame=null; // ImageData
+let detectionBuffer = [];
+let metrics = {runs:0, successes:0, lastTime:null, rows:[]};
+
+// Agent classes
+function randEdgePos(){
+  // spawn on random edge with random inward direction
+  const side = Math.floor(Math.random()*4);
+  let x,y,dx,dy;
+  if(side===0){ x=0; y=Math.random()*H; dx=1; dy=(Math.random()*2-1); }
+  else if(side===1){ x=W; y=Math.random()*H; dx=-1; dy=(Math.random()*2-1); }
+  else if(side===2){ x=Math.random()*W; y=0; dx=(Math.random()*2-1); dy=1; }
+  else { x=Math.random()*W; y=H; dx=(Math.random()*2-1); dy=-1; }
+  // normalize dir
+  const len=Math.hypot(dx,dy)||1; dx/=len; dy/=len;
+  return {x,y,dx,dy};
+}
+
+class Agent{
+  constructor(x,y,size,color){ this.x=x; this.y=y; this.size=size; this.color=color; this.vx=0; this.vy=0; }
+  draw(ctx){ ctx.fillStyle=this.color; ctx.beginPath(); ctx.rect(this.x-this.size/2,this.y-this.size/2,this.size,this.size); ctx.fill(); }
+}
+
+let target, chaser;
+function spawnAgents(){
+  const s = randEdgePos();
+  target = new Agent(s.x,s.y,20,'#ffcc00');
+  // set target velocity
+  const speed = cfg.vTarget;
+  target.vx = s.dx * speed;
+  target.vy = s.dy * speed;
+  // frajola center
+  chaser = new Agent(W/2,H/2,45,'#42a5f5');
+}
+
+function resetSimulation(){
+  spawnAgents();
+  previousFrame = null;
+  detectionBuffer.length=0;
+  frameCount=0;
+  metrics.lastStart = performance.now();
+}
+
+resetSimulation();
+
+// ============== Detection (frame differencing + threshold + centroid) ==============
+function detectMovingObject(){
+  // draw scene to offscreen: only draw target (simulate camera seeing scene)
+  offCtx.clearRect(0,0,W,H);
+  // we'll draw target only (in practice the camera sees both, but detection should highlight moving target)
+  // To emulate more realistic noisy background, draw subtle noise
+  offCtx.fillStyle = 'rgb(10,12,20)';
+  offCtx.fillRect(0,0,W,H);
+  // draw target as bright blob
+  offCtx.fillStyle = '#ffffff';
+  offCtx.beginPath();
+  offCtx.ellipse(target.x, target.y, target.size/2, target.size/2, 0, 0, Math.PI*2);
+  offCtx.fill();
+
+  const image = offCtx.getImageData(0,0,W,H);
+  if(!previousFrame){ previousFrame = image; return null; }
+
+  const diff = new Uint8ClampedArray(W*H);
+  const t = cfg.thresh;
+  let sumX=0,sumY=0,count=0;
+  for(let i=0, px=0;i<image.data.length;i+=4, px++){
+    const r = image.data[i], g = image.data[i+1], b = image.data[i+2];
+    const rp = previousFrame.data[i], gp = previousFrame.data[i+1], bp = previousFrame.data[i+2];
+    const d = Math.abs(r-rp)+Math.abs(g-gp)+Math.abs(b-bp);
+    if(d > t){ diff[px]=255; const x = px % W; const y = Math.floor(px / W); sumX += x; sumY += y; count++; }
+  }
+  previousFrame = image;
+
+  if(count===0) return null;
+  const cx = sumX/count, cy = sumY/count;
+  return {cx,cy,count};
+}
+
+// ============== Pursuit strategies ==============
+function pursuitStep(detected){
+  // apply reaction delay: store detected positions and pop oldest after delay
+  if(detected){ detectionBuffer.push({x:detected.cx,y:detected.cy, t:frameCount}); }
+  if(detectionBuffer.length > cfg.delay + 1) detectionBuffer.shift();
+  const perceived = detectionBuffer.length? detectionBuffer[0] : null;
+
+  if(!perceived) return false; // no target perceived
+  const tx = perceived.x, ty = perceived.y;
+
+  // compute chaser velocity based on strategy
+  let vx=0, vy=0;
+  if(cfg.strategy==='pure'){
+    vx = tx - chaser.x; vy = ty - chaser.y;
+  } else if(cfg.strategy==='lead'){
+    // estimate target velocity by difference between last two detections
+    if(detectionBuffer.length>=2){
+      const a = detectionBuffer[detectionBuffer.length-2];
+      const b = detectionBuffer[detectionBuffer.length-1];
+      const estVx = (b.x - a.x); const estVy = (b.y - a.y);
+      // lead factor proportional to speeds
+      const leadFactor = 6; // tuneable
+      const leadX = tx + estVx*leadFactor;
+      const leadY = ty + estVy*leadFactor;
+      vx = leadX - chaser.x; vy = leadY - chaser.y;
+    } else { vx = tx - chaser.x; vy = ty - chaser.y; }
+  } else if(cfg.strategy==='intercept'){
+    // intercept: compute time-to-collision analytically in 2D (solve for t in relative motion)
+    // target pos and velocity in world coords (estimate from detections if possible)
+    let tvx = target.vx, tvy = target.vy; // we assume we can estimate roughly
+    // relative position
+    const rx = target.x - chaser.x, ry = target.y - chaser.y;
+    const a = tvx*tvx + tvy*tvy - cfg.vChaser*cfg.vChaser;
+    const b = 2*(rx*tvx + ry*tvy);
+    const c = rx*rx + ry*ry;
+    let ttc = 0;
+    if(Math.abs(a) < 1e-6){ ttc = -c/b; }
+    else{
+      const disc = b*b - 4*a*c;
+      if(disc>0){ const t1 = (-b + Math.sqrt(disc))/(2*a); const t2 = (-b - Math.sqrt(disc))/(2*a); ttc = Math.max(t1,t2); }
+      else ttc = -b/(2*a);
+    }
+    if(ttc>0 && ttc<500){
+      const aimX = target.x + tvx*ttc;
+      const aimY = target.y + tvy*ttc;
+      vx = aimX - chaser.x; vy = aimY - chaser.y;
+    } else { vx = tx - chaser.x; vy = ty - chaser.y; }
+  }
+
+  // normalize and apply chaser speed
+  const len = Math.hypot(vx,vy)||1;
+  const speed = cfg.vChaser;
+  chaser.x += (vx/len)*speed;
+  chaser.y += (vy/len)*speed;
+  return true;
+}
+
+// ============== Simulation step ==============
+function simStep(){
+  // update target
+  target.x += target.vx;
+  target.y += target.vy;
+  // bounce off edges (or respawn when fully outside)
+  if(target.x < -50 || target.x > W+50 || target.y < -50 || target.y > H+50){
+    // consider respawn as a 'escape' (no capture)
+    recordRun(false, frameCount);
+    spawnAgents();
+    return;
+  }
+
+  // detect
+  const detected = detectMovingObject();
+  const saw = detected !== null;
+
+  // pursuit step
+  const perceived = pursuitStep(detected);
+
+  // check capture
+  const dx = target.x - chaser.x; const dy = target.y - chaser.y;
+  const dist = Math.hypot(dx,dy);
+  if(dist < cfg.captureDist){
+    // capture
+    recordRun(true, frameCount);
+    spawnAgents();
+  }
+}
+
+// ============== Rendering ==============
+function render(){
+  ctx.clearRect(0,0,W,H);
+  // draw background grid
+  ctx.fillStyle = '#071024'; ctx.fillRect(0,0,W,H);
+
+  // draw detection mask overlay for debugging
+  // draw target and chaser
+  target.draw(ctx);
+  chaser.draw(ctx);
+
+  // draw icons
+  ctx.fillStyle='white'; ctx.font='12px monospace';
+  ctx.fillText('Frame: '+frameCount, 8, 14);
+
+  // draw detection centroid if any
+  const lastDetected = detectionBuffer.length? detectionBuffer[detectionBuffer.length-1] : null;
+  if(lastDetected){
+    ctx.beginPath(); ctx.strokeStyle='rgba(255,255,255,0.6)'; ctx.arc(lastDetected.x,lastDetected.y,10,0,Math.PI*2); ctx.stroke();
+  }
+
+  // HUD lines
+  ctx.beginPath(); ctx.strokeStyle='rgba(255,255,255,0.08)';
+  ctx.moveTo(0,H/2); ctx.lineTo(W,H/2); ctx.moveTo(W/2,0); ctx.lineTo(W/2,H);
+  ctx.stroke();
+}
+
+// ============== Metrics recording & batch runs ==============
+function recordRun(success, frames){
+  metrics.runs++;
+  if(success) metrics.successes++;
+  metrics.lastTime = frames;
+  metrics.rows.push({run:metrics.runs, strategy:cfg.strategy, vT:cfg.vTarget, vF:cfg.vChaser, success, frames});
+  updateTableRow(metrics.rows[metrics.rows.length-1]);
+  updateMetricsDisplay();
+}
+
+function updateTableRow(row){
+  const tbody = document.querySelector('#resultsTable tbody');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${row.run}</td><td>${row.strategy}</td><td>${row.vT}</td><td>${row.vF}</td><td>${row.success? 'Sim':'Não'}</td><td>${row.frames}</td>`;
+  tbody.prepend(tr);
+}
+
+function updateMetricsDisplay(){
+  document.getElementById('frameCount').textContent = frameCount;
+  document.getElementById('detected').textContent = detectionBuffer.length? 'Sim' : 'Não';
+  document.getElementById('timeToCapture').textContent = metrics.lastTime===null? '--' : metrics.lastTime;
+  document.getElementById('successRate').textContent = `${metrics.successes} / ${metrics.runs}`;
+}
+
+async function runBatch(n=50){
+  const origStrategy = cfg.strategy;
+  const origRuns = metrics.runs;
+  for(let i=0;i<n;i++){
+    // randomize some parameters slightly
+    spawnAgents();
+    frameCount=0; detectionBuffer.length=0; previousFrame=null;
+    // run until capture or time limit (e.g., 2000 frames)
+    let limit = 2000; let captured=false;
+    while(limit--){
+      simStep(); render(); frameCount++;
+      if(metrics.rows.length>origRuns+i) { captured = metrics.rows[metrics.rows.length-1].success; break; }
+      // run faster than real-time during batch
+      await new Promise(r=>setTimeout(r,0));
+    }
+    if(!captured){ recordRun(false, frameCount); }
+  }
+}
+
+// ============== Main loop and timing ==============
+let accumulator=0, lastTime = performance.now();
+function mainLoop(now){
+  const delta = now - lastTime; lastTime = now;
+  const stepMs = 1000 / cfg.fps;
+  accumulator += delta;
+  let stepped = false;
+  while(accumulator >= stepMs){
+    if(running || stepOnce){
+      simStep(); frameCount++; updateMetricsDisplay();
+    }
+    accumulator -= stepMs; stepped = true; stepOnce=false;
+  }
+  if(stepped) render();
+  requestAnimationFrame(mainLoop);
+}
+requestAnimationFrame(mainLoop);
+
+// ============== UI bindings ==============
+function bindUI(){
+  document.getElementById('play').addEventListener('click', ()=>{ running = !running; document.getElementById('play').textContent = running? 'Pausar' : 'Iniciar'; });
+  document.getElementById('step').addEventListener('click', ()=>{ stepOnce=true; simStep(); frameCount++; render(); updateMetricsDisplay(); });
+  document.getElementById('reset').addEventListener('click', ()=>{ resetSimulation(); render(); });
+  document.getElementById('vTarget').addEventListener('input', (e)=>{ cfg.vTarget = +e.target.value; document.getElementById('vTargetLbl').textContent = cfg.vTarget; target.vx = (target.vx? Math.sign(target.vx):1)*cfg.vTarget; target.vy = (target.vy? Math.sign(target.vy):0)*cfg.vTarget; });
+  document.getElementById('vChaser').addEventListener('input', (e)=>{ cfg.vChaser = +e.target.value; document.getElementById('vChaserLbl').textContent = cfg.vChaser; });
+  document.getElementById('fps').addEventListener('input', (e)=>{ cfg.fps=+e.target.value; document.getElementById('fpsLbl').textContent = cfg.fps; });
+  document.getElementById('thresh').addEventListener('input', (e)=>{ cfg.thresh=+e.target.value; document.getElementById('thLbl').textContent = cfg.thresh; });
+  document.getElementById('delay').addEventListener('input', (e)=>{ cfg.delay=+e.target.value; document.getElementById('delayLbl').textContent = cfg.delay; });
+  document.getElementById('strategy').addEventListener('change', (e)=>{ cfg.strategy = e.target.value; });
+  document.getElementById('captureDist').addEventListener('input', (e)=>{ cfg.captureDist=+e.target.value; document.getElementById('capLbl').textContent = cfg.captureDist; });
+  document.getElementById('runBatch').addEventListener('click', async ()=>{ document.getElementById('runBatch').textContent = 'Rodando...'; await runBatch(50); document.getElementById('runBatch').textContent = 'Rodar 50 cenários'; });
+  document.getElementById('downloadLog').addEventListener('click', ()=>{ exportCSV(); });
+  document.getElementById('resetStats').addEventListener('click', ()=>{ metrics.runs=0; metrics.successes=0; metrics.rows.length=0; const tbody=document.querySelector('#resultsTable tbody'); tbody.innerHTML=''; updateMetricsDisplay(); });
+}
+bindUI();
+
+// ============== CSV export ==============
+function exportCSV(){
+  if(!metrics.rows.length) return alert('Sem dados. Rode alguns cenários primeiro.');
+  const header = ['run','strategy','vT','vF','success','frames'];
+  const lines = [header.join(',')];
+  for(const r of metrics.rows){ lines.push([r.run,r.strategy,r.vT,r.vF,r.success?r.success:'',r.frames].join(',')); }
+  const blob = new Blob([lines.join('\n')], {type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'sim_results.csv'; a.click(); URL.revokeObjectURL(url);
+}
+
+// initial render
+render(); updateMetricsDisplay();
+
+</script>
+</body>
+</html>
